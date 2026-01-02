@@ -1,0 +1,113 @@
+name: Linux SSH Access
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-ssh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3600
+    steps:
+      - name: Create SSH User
+        env:
+          SSH_USER: sshuser
+          SSH_PASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          # Create user with home directory
+          sudo useradd -m -s /bin/bash $SSH_USER
+          
+          # Set password
+          echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
+          
+          # Add to sudo group for admin access
+          sudo usermod -aG sudo $SSH_USER
+          
+          # Enable password authentication for SSH
+          sudo sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          
+          # Restart SSH service
+          sudo systemctl restart sshd
+
+      - name: Configure Firewall
+        run: |
+          # Allow SSH through firewall
+          sudo ufw allow 22/tcp
+          sudo ufw --force enable
+
+      - name: Install Tailscale
+        run: |
+          # Add Tailscale repository
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.noarmor.gpg | sudo tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null
+          curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/jammy.tailscale-list | sudo tee /etc/apt/sources.list.d/tailscale.list
+          
+          # Install Tailscale
+          sudo apt-get update
+          sudo apt-get install -y tailscale
+
+      - name: Authenticate Tailscale
+        run: |
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --ssh
+
+      - name: Get Tailscale IP
+        id: tsip
+        run: |
+          echo "Waiting for Tailscale IP assignment..."
+          timeout=120
+          elapsed=0
+          
+          while [ $elapsed -lt $timeout ]; do
+            sleep 5
+            ip=$(sudo tailscale ip -4 2>/dev/null)
+            
+            if [ -n "$ip" ]; then
+              echo "Success! Tailscale IP: $ip"
+              echo "TAILSCALE_IP=$ip" >> $GITHUB_ENV
+              echo "ip=$ip" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+            
+            elapsed=$((elapsed + 5))
+            echo "Tailscale service still initializing..."
+          done
+          
+          echo "Timed out waiting for Tailscale IP. Check your Auth Key and Tailnet settings."
+          exit 1
+
+      - name: Debug SSH State
+        run: |
+          echo "TAILSCALE_IP from env: $TAILSCALE_IP"
+          echo "SSH service status:"
+          sudo systemctl status sshd --no-pager
+          echo "Listening on port 22:"
+          sudo netstat -tuln | grep :22 || sudo ss -tuln | grep :22
+          echo "SSH configuration check:"
+          sudo sshd -T | grep passwordauthentication
+
+      - name: Test SSH Port over Tailscale
+        run: |
+          ip="${{ steps.tsip.outputs.ip }}"
+          echo "Testing SSH connectivity on $ip:22"
+          timeout 10 bash -c "cat < /dev/null > /dev/tcp/$ip/22" && echo "SSH port accessible" || { echo "SSH port not accessible over Tailscale"; exit 1; }
+
+      - name: SSH Access Info
+        run: |
+          ip="$TAILSCALE_IP"
+          echo "=== SSH SESSION ACTIVE ==="
+          echo "Tailscale IP: $ip"
+          echo "SSH Port: 22"
+          echo "Username: sshuser"
+          echo "Password: ${{ secrets.SSH_PASSWORD }}"
+          echo ""
+          echo "Connect via SSH:"
+          echo "  ssh sshuser@$ip"
+          echo ""
+          echo "Or using password directly:"
+          echo "  sshpass -p '${{ secrets.SSH_PASSWORD }}' ssh sshuser@$ip"
+          echo "=========================="
+
+      - name: Keep Alive
+        run: |
+          while true; do
+            echo "$(date) - SSH active... Cancel workflow to stop."
+            sleep 300
+          done
